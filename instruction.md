@@ -1,22 +1,17 @@
 # Build Instructions
 
-## 1. Encode apps.json to Base64
+## Build Docker Image
 
-```bash
-export APPS_JSON_BASE64=$(base64 -w 0 apps.json)
-
-echo $APPS_JSON_BASE64
-```
-
-## 2. Build Docker Image
+> **Security Note:** `apps.json` is passed via BuildKit `--secret` instead of `--build-arg` to prevent
+> sensitive data (private repo URLs/tokens) from being persisted in image metadata.
 
 ```bash
 docker buildx build \
   --load \
   --build-arg FRAPPE_BRANCH=version-16 \
-  --build-arg APPS_JSON_BASE64=$APPS_JSON_BASE64 \
+  --secret id=apps_json,src=apps.json \
   --file images/layered/Containerfile \
-  --tag {username}/frappe-aio:13feb2026 \
+  --tag achelesstech/frappe-aio:13feb2026 \
   .
 ```
 
