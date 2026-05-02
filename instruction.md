@@ -8,10 +8,11 @@
 ```bash
 docker buildx build \
   --load \
+  --no-cache \
   --build-arg FRAPPE_BRANCH=version-16 \
   --secret id=apps_json,src=apps.json \
   --file images/layered/Containerfile \
-  --tag achelesstech/frappe-aio:13feb2026 \
+  --tag achelesstech/frappe-aio:latest \
   .
 ```
 
@@ -21,6 +22,10 @@ docker buildx build \
 [
     {
       "url": "https://github.com/frappe/erpnext",
+      "branch": "version-16"
+    },
+    {
+      "url": "https://github.com/frappe/payments",
       "branch": "version-16"
     },
     {

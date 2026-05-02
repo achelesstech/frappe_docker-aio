@@ -10,9 +10,5 @@
     {
       "url": "https://github.com/frappe/crm",
       "branch": "main"
-    },
-    {
-      "url": "https://github.com/frappe/lms",
-      "branch": "main"
     }
 ]

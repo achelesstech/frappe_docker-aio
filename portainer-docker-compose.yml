@@ -1,0 +1,366 @@
+# =============================================================================
+# Frappe 16 / ERPNext 16 / HRMS 16 / CRM / LMS  —  host04.freshie.farm
+# Portainer Stack  |  Updated April 2026
+# =============================================================================
+# Exposes: erp.freshie.farm
+#
+# Pre-requisites (run ONCE on host04):
+#   docker network create proxy        (already exists from Traefik stack)
+#
+# Portainer stack environment variables (set in the Portainer UI):
+#   DB_ROOT_PASSWORD        strong random — MariaDB root password
+#   ADMIN_PASSWORD          strong random — Frappe "Administrator" user password
+#   SITE_NAME               erp.freshie.farm
+#   ERP_IMAGE               roneybd/frappe-aio:28feb2026
+#
+# Defined as variables so you can bump the image tag or test on a staging
+# hostname without editing the compose body.
+#
+# After first successful deploy:
+#   - Remove/comment the `create-site` service (idempotency — see notes)
+#   - Rotate ADMIN_PASSWORD and change it inside ERPNext
+# =============================================================================
+
+x-backend-defaults: &backend-defaults
+  image: ${ERP_IMAGE}
+  networks:
+    - erp-internal
+    - proxy
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+networks:
+  erp-internal:
+    driver: bridge
+    internal: true           # no internet egress for db/redis/workers
+  proxy:
+    external: true
+
+volumes:
+  db-data:
+    driver: local
+  redis-queue-data:
+    driver: local
+  sites:
+    driver: local
+  logs:
+    driver: local
+
+services:
+
+  # ===========================================================================
+  # CONFIGURATOR — one-shot init
+  # ===========================================================================
+  configurator:
+    <<: *backend-defaults
+    container_name: erp-aio-configurator
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 3306;
+        bench set-config -g redis_cache "redis://redis-cache:6379";
+        bench set-config -g redis_queue "redis://redis-queue:6379";
+        bench set-config -g redis_socketio "redis://redis-queue:6379";
+        bench set-config -gp socketio_port 9000;
+    depends_on:
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  # ===========================================================================
+  # CREATE-SITE — one-shot site provisioning  (remove after first deploy)
+  # ===========================================================================
+  create-site:
+    <<: *backend-defaults
+    container_name: erp-aio-create-site
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] &&
+              [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] &&
+              [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "ERROR: common_site_config.json missing required keys";
+            exit 1;
+          fi
+        done;
+        if [[ -d "sites/${SITE_NAME}" ]]; then
+          echo "Site ${SITE_NAME} already exists — skipping";
+          exit 0;
+        fi;
+        bench new-site ${SITE_NAME}
+        --mariadb-user-host-login-scope='%'
+        --admin-password=${ADMIN_PASSWORD}
+        --db-root-username=root
+        --db-root-password=${DB_ROOT_PASSWORD}
+        --install-app erpnext
+        --install-app payments
+        --install-app hrms
+        --install-app crm
+        --install-app lms
+        --set-default;
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # BACKEND — Frappe/Gunicorn
+  # ===========================================================================
+  backend:
+    <<: *backend-defaults
+    container_name: erp-aio-backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -H 'Host: ${SITE_NAME}' http://localhost:8000/api/method/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  # ===========================================================================
+  # DATABASE — MariaDB 11.8 LTS
+  # ===========================================================================
+  db:
+    image: mariadb:11.8
+    container_name: erp-aio-db
+    networks:
+      - erp-internal
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --max-connections=500
+      - --innodb-buffer-pool-size=1G
+      - --innodb-log-file-size=256M
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      TZ: Asia/Dhaka
+    volumes:
+      - db-data:/var/lib/mysql
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ===========================================================================
+  # FRONTEND — Nginx → Traefik (host04 file-based middlewares)
+  # ===========================================================================
+  frontend:
+    image: ${ERP_IMAGE}
+    container_name: erp-aio-frontend
+    networks:
+      - erp-internal
+      - proxy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 10.0.0.0/8
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "on"
+      PROXY_READ_TIMEOUT: 300
+      CLIENT_MAX_BODY_SIZE: 100m
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      backend:
+        condition: service_healthy
+      websocket:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -H 'Host: ${SITE_NAME}' http://localhost:8080/api/method/ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+
+      # ── Router (HTTPS only; web→websecure redirect is global on host04) ──
+      - "traefik.http.routers.erp-aio.rule=Host(`erp.freshie.farm`)"
+      - "traefik.http.routers.erp-aio.entrypoints=websecure"
+      - "traefik.http.routers.erp-aio.tls.certresolver=cloudflare"
+      - "traefik.http.routers.erp-aio.service=erp-aio-svc"
+      # chain-default = secure-headers (X-Frame-Options SAMEORIGIN) + rate-limit + compress
+      # buffer-uploads = request body buffering (bump to 100 MB in middlewares.yml)
+      - "traefik.http.routers.erp-aio.middlewares=chain-default@file,buffer-uploads@file"
+      - "traefik.http.routers.erp-aio.priority=10"
+
+      # ── Service ──────────────────────────────────────────────────────────
+      - "traefik.http.services.erp-aio-svc.loadbalancer.server.port=8080"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.passhostheader=true"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.sticky.cookie=true"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.sticky.cookie.name=erp_sticky"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.sticky.cookie.secure=true"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.sticky.cookie.httponly=true"
+      - "traefik.http.services.erp-aio-svc.loadbalancer.sticky.cookie.samesite=lax"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ===========================================================================
+  # QUEUE WORKERS
+  # ===========================================================================
+  queue-long:
+    <<: *backend-defaults
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  queue-short:
+    <<: *backend-defaults
+    command: ["bench", "worker", "--queue", "short,default"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ===========================================================================
+  # REDIS — Queue (persistent) + Cache (ephemeral)
+  # ===========================================================================
+  redis-queue:
+    image: redis:7.2-alpine
+    container_name: erp-aio-redis-queue
+    networks:
+      - erp-internal
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction           # queues must NOT be evicted — jobs would vanish
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis-cache:
+    image: redis:7.2-alpine
+    container_name: erp-aio-redis-cache
+    networks:
+      - erp-internal
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ===========================================================================
+  # SCHEDULER
+  # ===========================================================================
+  scheduler:
+    <<: *backend-defaults
+    container_name: erp-aio-scheduler
+    command: ["bench", "schedule"]
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  # ===========================================================================
+  # WEBSOCKET — Socket.IO / Node
+  # ===========================================================================
+  websocket:
+    <<: *backend-defaults
+    container_name: erp-aio-websocket
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        until [[ -f sites/common_site_config.json ]] &&
+              [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_socketio // empty"` ]];
+        do
+          echo "Waiting for Redis config";
+          sleep 2;
+        done;
+        echo "Starting websocket server";
+        node /home/frappe/frappe-bench/apps/frappe/socketio.js
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+      redis-queue:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9000/socket.io/?EIO=4&transport=polling' | grep -q 'sid' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
